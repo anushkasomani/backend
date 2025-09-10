@@ -1,67 +1,13 @@
-# from fastapi import FastAPI, HTTPException
-# from pydantic import BaseModel
-# import pandas as pd
-# from services.planner.plan_analyzer import analyze_plan
-# from services.data.ohlcv import load_ohlcv
-# from services.data.sentiment import fetch_cp_headlines, score_headlines
-# from engine.backtest import run_backtest
-# from dotenv import load_dotenv
-# from services.planner.app import plan_debug
-# import os  
-# load_dotenv()
-# auth_token=os.getenv("CP_AUTH_TOKEN")
-# app = FastAPI()
-
-# class BacktestReq(BaseModel):
-#     plan: dict
-#     start: str | None = None
-#     end: str | None = None
-#     cp_key: str | None = None
-
-# # #for debugging 
-# # plan_res= plan_debug("Trade BTC and ETH when CLOSE is greater than SMA(30) use best possible techniques")
-# # BackTest= {
-# #     "plan": plan_res,
-# #     "start": None,
-# #     "end": None,
-# #     "cp_key": auth_token
-# # }
-
-# @app.post("/backtest")
-# def backtest(req: BacktestReq):
-#     try:
-#         meta = analyze_plan(req.plan)
-#         assets = meta["assets"]; days = meta["lookback_days"]
-#         ohlcv = {a: load_ohlcv(a, days) for a in assets}
-#         cp = fetch_cp_headlines(auth_token)
-#         sent = score_headlines(cp)
-#         ec, stats = run_backtest(req.plan, ohlcv, sent, start=req.start, end=req.end)
-#         return {"stats": stats, "equity_curve": [{"t": str(t), "equity": float(v)} for t,v in ec["equity"].items()]}
-#     except Exception as e:
-#         raise HTTPException(400, str(e))
-
-# # def main(req: BacktestReq=BackTest):
-# #     try:
-# #         meta = analyze_plan(req.plan)
-# #         assets = meta["assets"]; days = meta["lookback_days"]
-# #         ohlcv = {a: load_ohlcv(a, days) for a in assets}
-# #         cp = fetch_cp_headlines(auth_token)
-# #         sent = score_headlines(cp)
-# #         ec, stats = run_backtest(req.plan, ohlcv, sent, start=req.start, end=req.end)
-# #         print({"stats": stats, "equity_curve": [{"t": str(t), "equity": float(v)} for t,v in ec["equity"].items()]})
-# #     except Exception as e:
-# #         raise HTTPException(400, str(e))
-    
-# # if __name__ == "__main__":
-# #     print(main())
-
-
 import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pprint import pprint
-from services.planner.plan_analyzer import build_plan_json_from_text, analyze_features, build_plan_with_gemini
+from services.planner.plan_analyzer import build_plan_json_from_text, analyze_features, build_plan_with_gemini, classify_intent, parse_scan_query
+from services.data.data_layer import top_tickers_from_coingecko
 from services.data.data_layer import load_universe
+from trade_patterns.signals.scanner import scan
+from trade_patterns.signals.render_helpers import render_cards_to_base64
+from trade_patterns.data.ohlcv_intraday import load_ohlcv as tp_load_ohlcv
 from services.data.sentiment import fetch_headlines, rolling_sentiment
 from engine.engine import Plan
 from engine.backtest import run_backtest
@@ -95,6 +41,10 @@ app.add_middleware(
 
 class PlanRequest(BaseModel):
     text: str
+    render: bool = True
+    max_render: int = 3
+    png_width: int = 900
+    png_height: int = 500
 
 
 class BacktestReq(BaseModel):
@@ -124,9 +74,72 @@ def to_plan_obj(pj: dict) -> Plan:
 def get_plan(req: PlanRequest):
     """Convert user text into Plan JSON using existing helper (no Gemini)."""
     try:
+        intent = classify_intent(req.text)
+        # If intent is a scan request, run the scanner and return cards (with embedded PNGs)
+        if intent == "scan":
+            scan_q = parse_scan_query(req.text)
+            # If user asked generically for trending/spike tokens (no explicit symbols),
+            # prefer GeckoTerminal trending pools for real-time discovery.
+            from services.data.geckoterminal import trending_pools
+            # Decide if the user asked for generic market discovery. Rely on the
+            # parser's `symbols_explicit` flag instead of fragile substring checks
+            # so we correctly treat prompts like "tokens which spiked within 5m".
+            is_generic_symbols = not bool(scan_q.get("symbols_explicit", False))
+            if scan_q.get("filters", {}).get("recent_breakout") and is_generic_symbols:
+                # fetch trending pools for the requested timeframe
+                duration = scan_q.get("tf", "5m")
+                pools = trending_pools(duration=duration)
+                # return the raw pool attributes for now; mapping to symbols/ohlcv is left for future
+                pools_simplified = []
+                for p in pools:
+                    attrs = p.get("attributes", {})
+                    pools_simplified.append({
+                        "id": p.get("id"),
+                        "network": p.get("relationships", {}).get("network", {}).get("data", {}).get("id"),
+                        "name": attrs.get("name"),
+                        "price_change_percentage": attrs.get("price_change_percentage", {}),
+                        "volume_usd": attrs.get("volume_usd", {}),
+                        "reserve_in_usd": attrs.get("reserve_in_usd"),
+                        "pool_created_at": attrs.get("pool_created_at")
+                    })
+                # Skipping OHLCV fetch from GeckoTerminal and returning simplified pool data directly.
+                return {"intent": "scan_trending", "duration": duration, "cards": pools_simplified}
+            # if user didn't specify symbols explicitly, perform market discovery
+            if not scan_q.get("symbols") or not scan_q.get("symbols_explicit"):
+                # fetch top tickers by volume and use top N (limit)
+                try:
+                    top = top_tickers_from_coingecko(per_page=50)
+                    scan_q["symbols"] = top[: scan_q.get("limit", 12)]
+                except Exception:
+                    scan_q["symbols"] = ["BTC","ETH","SOL","BNB"]
+            # call the scanner — map 'filters' returned by parser to the scan() parameter names
+            filt = scan_q.get("filters") or {}
+            indicator_filters = filt.get("indicators") if isinstance(filt, dict) else None
+            recent_breakout_flag = bool(filt.get("recent_breakout", False))
+            recency_bars = int(filt.get("recency_bars", 5))
+
+            cards_block = scan(
+                symbols=scan_q.get("symbols"),
+                tf=scan_q.get("tf"),
+                patterns=scan_q.get("patterns"),
+                indicator_filters=indicator_filters,
+                recent_breakout_flag=recent_breakout_flag,
+                recency_bars=recency_bars,
+                bars=scan_q.get("bars", 720),
+                sort=scan_q.get("sort", "prob"),
+                limit=scan_q.get("limit", 12)
+            )
+            # optionally render PNGs for top results using shared helper
+            if req.render and cards_block.get("cards"):
+                render_cards_to_base64(cards_block.get("cards", []), max_render=req.max_render,
+                                       png_width=req.png_width, png_height=req.png_height,
+                                       default_tf=scan_q.get("tf"), bars=scan_q.get("bars", 720))
+            return {"intent": "scan", "query": scan_q, "cards": cards_block.get("cards", [])}
+
+        # otherwise treat as plan-generation intent
         plan_json = build_plan_with_gemini(req.text)
         analysis = analyze_features(plan_json)
-        return {"plan": plan_json, "analysis": analysis}
+        return {"intent": "plan", "plan": plan_json, "analysis": analysis}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -203,4 +216,3 @@ if __name__ == "__main__":
         print(ec.tail())
     except Exception:
         pass
-

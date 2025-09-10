@@ -49,3 +49,23 @@ def load_universe(universe: list[str], since_days=540) -> dict[str, pd.DataFrame
     return out
 
 
+def top_tickers_from_coingecko(vs_currency: str = "usd", per_page: int = 50) -> list[str]:
+    """Return top tickers (symbols) by 24h volume using CoinGecko /coins/markets.
+    Returns uppercase ticker symbols (eg. 'BTC', 'ETH').
+    """
+    base = "https://api.coingecko.com/api/v3"
+    url = f"{base}/coins/markets"
+    try:
+        r = requests.get(url, params={"vs_currency": vs_currency, "order": "volume_desc", "per_page": per_page, "page": 1}, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        syms = []
+        for item in j:
+            s = item.get("symbol")
+            if s:
+                syms.append(s.upper())
+        return syms
+    except Exception:
+        return ["BTC","ETH","SOL","BNB","DOGE","SHIB","PEPE"]
+
+

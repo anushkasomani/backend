@@ -59,7 +59,14 @@ def load_ohlcv(symbol: str, timeframe: str, bars: int = 720, exchange_id="binanc
     except Exception:
         end_s = int(time.time()); start_s = end_s - lookback_minutes*60
         df = cg_market_chart_range(symbol, start_s=start_s, end_s=end_s)
-    rule = timeframe if timeframe != "1d" else "1D"
+
+    # map timeframe to pandas resample rule (use offset aliases)
+    rule_map = {
+        "1m": "1T", "3m": "3T", "5m": "5T", "15m": "15T", "30m": "30T",
+        "1h": "1H", "2h": "2H", "4h": "4H", "6h": "6H", "12h": "12H", "1d": "1D"
+    }
+    rule = rule_map.get(timeframe, "1D")
+
     o = df["open"].resample(rule).first()
     h = df["high"].resample(rule).max()
     l = df["low"].resample(rule).min()

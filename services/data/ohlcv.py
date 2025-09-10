@@ -17,7 +17,15 @@ def ccxt_ohlcv(symbol_pair="BTC/USDT", exchange_id="binance", timeframe="1d", si
         time.sleep(ex.rateLimit/1000.0)
     df = pd.DataFrame(rows, columns=["t","open","high","low","close","volume"]).set_index("t")
     df.index = pd.to_datetime(df.index, unit="ms", utc=True)
-    return df[["close","volume"]].resample("1D").last().dropna()
+    # Resample to daily OHLCV (open first, high max, low min, close last, volume sum)
+    daily = df.resample("1D").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }).dropna()
+    return daily
 
 def cg_market_chart_range(symbol: str, vs="usd", days=540):
     cid = COINGECKO_IDS[symbol]
@@ -29,10 +37,17 @@ def cg_market_chart_range(symbol: str, vs="usd", days=540):
     j = r.json()
     dfp = pd.DataFrame(j["prices"], columns=["t","price"]).set_index("t")
     dfv = pd.DataFrame(j["total_volumes"], columns=["t","volume"]).set_index("t")
-    df = pd.concat([dfp, dfv], axis=1)
-    df.index = pd.to_datetime(df.index, unit="ms", utc=True)
-    df = df.resample("1D").last().dropna()
-    return df.rename(columns={"price":"close"})[["close","volume"]]
+    dfp.index = pd.to_datetime(dfp.index, unit="ms", utc=True)
+    dfv.index = pd.to_datetime(dfv.index, unit="ms", utc=True)
+
+    # build daily OHLC from the price series
+    ohlc = dfp["price"].resample("1D").agg(["first", "max", "min", "last"]).dropna()
+    ohlc.columns = ["open", "high", "low", "close"]
+
+    vol = dfv.resample("1D").last()
+
+    df_daily = pd.concat([ohlc, vol], axis=1).dropna()
+    return df_daily[["open", "high", "low", "close", "volume"]]
 
 def load_ohlcv(symbol: str, days: int) -> pd.DataFrame:
     try:
