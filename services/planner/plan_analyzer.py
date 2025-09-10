@@ -225,18 +225,26 @@ def parse_scan_query(text: str) -> Dict[str, Any] | None:
         indicators.append("EMA(50)<EMA(200)")
     if "above 30d" in T or "price > 30d ma" in T:
         indicators.append("CLOSE>SMA(30)")
-    recent_breakout_flag = "breakout" in T or "just broke" in T or "recently broke" in T
+    # treat words like spike/trending as an explicit breakout/volume signal
+    recent_breakout_flag = any(k in T for k in ["breakout", "just broke", "recently broke", "spike", "spiked", "spiking", "volume spike", "trending", "trend"]) 
     symbols = []
-    tickers = ["btc","eth","sol","bnb","xrp","ada","avax","ltc","link","matic","doge","shib","pepe","wif","bonk","floki","brett"]
+    # broaden default tickers for discovery
+    tickers = ["btc","eth","sol","bnb","xrp","ada","avax","ltc","link","matic","doge","shib","pepe","wif","bonk","floki","brett","sui","near","apt","vet","eos"]
     for k in tickers:
         if re.search(rf"\b{k}\b", T): symbols.append(k.upper())
-    if not symbols:
-        symbols = ["BTC","ETH","SOL","DOGE","SHIB","PEPE"]
+    symbols_explicit = bool(symbols)
+    # do not inject hardcoded defaults here; let the caller decide discovery
+    # if no symbols were mentioned the caller can fetch top tickers from market data
     limit = 12
     m = re.search(r"top\s+(\d+)", T)
     if m: limit = int(m.group(1))
+    # If the user asked about spikes/trending, add a volume filter to capture volume pickups
+    if recent_breakout_flag and "VOLUME>" not in " ".join(indicators):
+        indicators.append("VOLUME>1.5*VOL_SMA(20)")
+
     return {
         "symbols": symbols,
+        "symbols_explicit": symbols_explicit,
         "tf": tf,
         "patterns": list(pats),
         "filters": {"indicators": indicators, "recent_breakout": recent_breakout_flag, "recency_bars": 5},
@@ -246,7 +254,50 @@ def parse_scan_query(text: str) -> Dict[str, Any] | None:
     }
 
 def classify_intent(text: str) -> str:
+    """Classify whether the user's free-text is asking for a "scan" (search/visualize) or a
+    full "plan" (strategy specification). This uses a small scoring heuristic so that
+    ambiguous technical terms (eg. "EMA") don't force a scan when the user really means
+    to describe a plan.
+    """
     T = text.lower()
-    if any(k in T for k in ["forming","breakout","double top","double bottom","triangle","flag","wedge","head and shoulders","h&s","doji","hammer","engulfing","rsi","ema","find tokens","show tokens"]):
-        return "scan"
-    return "plan"
+
+    # Keywords that indicate a scan/query intent (look for tokens/patterns/timeframes)
+    scan_kw = [
+        "find","show","list","which","scan","search","find tokens","show tokens",
+    "breakout","forming","just broke","recently broke","volume spike","volume pickup",
+    "give","give me","latest",
+        "top","rank","best", "where"
+    ]
+
+    # Keywords that indicate the user is asking for a Plan / strategy spec
+    plan_kw = [
+        "trade","plan","when to","strategy","allocate","allocate to","weight","rebalance",
+        "buy","sell","entry","stop","take profit","tp","sl","risk","risk management",
+        "regime","tilt","execution","weighting","portfolio","position sizing"
+    ]
+
+    # Ambiguous technical tokens that alone should not force a scan
+    tech_kw = ["rsi","ema","sma","ma","bollinger","adx","macd","atr","vwap"]
+
+    score_scan = 0
+    score_plan = 0
+
+    for k in scan_kw:
+        if k in T: score_scan += 2
+    for k in plan_kw:
+        if k in T: score_plan += 3
+    for k in tech_kw:
+        if k in T: score_plan += 1  # treat technical terms as mild plan signal unless other scan cues exist
+
+    # If text starts with an interrogative or contains a question mark, bias to scan
+    if T.strip().startswith(tuple(["find","show","which","what","list","give"])) or "?" in T:
+        score_scan += 2
+
+    # Presence of an explicit timeframe generally indicates a scan request (eg. "on 1h", "5m")
+    if re.search(r"\b(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h|1d)\b", T):
+        score_scan += 2
+
+    # Final tie-breaker: prefer plan when scores are equal (so mentioning EMA in a plan won't flip to scan)
+    if score_plan >= score_scan:
+        return "plan"
+    return "scan"

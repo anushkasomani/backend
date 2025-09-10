@@ -30,10 +30,12 @@ def zigzag_by_pct(close: pd.Series, pct: float = 0.015) -> List[Pivot]:
                 last_idx = i; last_price = float(p)
     return pivots
 
-def recent_pivots(df: pd.DataFrame, tf: str) -> List[Pivot]:
+def recent_pivots(df: pd.DataFrame, tf: str, sensitivity: float = 1.0) -> List[Pivot]:
+    """Return recent pivots; sensitivity <1.0 => more pivots (lower threshold)."""
     tf_eps = {
         "1m":0.004, "3m":0.005, "5m":0.006, "15m":0.008, "30m":0.010,
         "1h":0.012, "2h":0.015, "4h":0.018, "6h":0.020, "12h":0.025, "1d":0.030
     }
-    pct = tf_eps.get(tf, 0.015)
+    base_pct = tf_eps.get(tf, 0.015)
+    pct = max(0.0005, base_pct * max(0.5, sensitivity))
     return zigzag_by_pct(df["close"], pct=pct)
