@@ -104,14 +104,19 @@ def get_plan(req: PlanRequest):
                     })
                 # Skipping OHLCV fetch from GeckoTerminal and returning simplified pool data directly.
                 return {"intent": "scan_trending", "duration": duration, "cards": pools_simplified}
+            
             # if user didn't specify symbols explicitly, perform market discovery
             if not scan_q.get("symbols") or not scan_q.get("symbols_explicit"):
                 # fetch top tickers by volume and use top N (limit)
                 try:
                     top = top_tickers_from_coingecko(per_page=50)
-                    scan_q["symbols"] = top[: scan_q.get("limit", 12)]
+                    # Define and filter out common stablecoins to prevent errors
+                    stablecoins = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "BUSD"}
+                    filtered_top = [t for t in top if t.upper() not in stablecoins]
+                    scan_q["symbols"] = filtered_top[: scan_q.get("limit", 12)]
                 except Exception:
                     scan_q["symbols"] = ["BTC","ETH","SOL","BNB"]
+
             # call the scanner — map 'filters' returned by parser to the scan() parameter names
             filt = scan_q.get("filters") or {}
             indicator_filters = filt.get("indicators") if isinstance(filt, dict) else None
