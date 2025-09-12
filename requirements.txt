@@ -7,3 +7,4 @@ ccxt
 vaderSentiment
 python-dotenv
 google-generativeai
+matplotlib
